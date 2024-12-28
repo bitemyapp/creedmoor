@@ -1,14 +1,7 @@
 use get_size::GetSize;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
+use std::path::Path;
 use sled::{Db, Transactional, Tree};
 use sled::transaction::TransactionalTree;
-
-#[derive(Debug)]
-struct DiskEntry {
-    /// The size in bytes of the stored data on disk.
-    size: usize,
-}
 
 use thiserror::Error;
 
@@ -20,21 +13,32 @@ pub enum CreedmoorError {
     SledError(#[from] sled::Error),
     #[error("Got error on sled transaction, was: {0}")]
     SledTransactionError(#[from] sled::transaction::TransactionError),
+    #[error("Got error on sled unabortable transaction, was: {0}")]
+    SledUnabortableTransactionError(#[from] sled::transaction::UnabortableTransactionError),
+    #[error("Got error on sled conflictable transaction, was: {0}")]
+    SledConflictableTransactionError(#[from] sled::transaction::ConflictableTransactionError),
     #[error("Object size too large: {0}")]
     CacheObjectSizeTooLarge(usize),
 }
 
+pub enum Op {
+    Add,
+    Sub,
+}
+
 /// Multi-layer LRU cache: memory + sled (disk).
 pub struct MultiLayerCache {
-    /// `memory_budget` just gets handed off to sled's [`cache_capacity`]
-    memory_budget: AtomicUsize,
-    disk_budget: AtomicUsize,
-    disk_usage: AtomicUsize,
+    disk_budget: usize,
     /// Sled database for on-disk storage
     db: Db,
 }
 
 impl MultiLayerCache {
+    const DISK_USAGE_TREE: &'static [u8; 10] = b"disk_usage";
+    const DISK_USAGE_KEY: &'static [u8; 7] = b"current";
+    const OBJECT_LRU: &'static [u8; 10] = b"object_lru";
+    const OBJECT_DATA: &'static [u8; 11] = b"object_data";
+
     /// Create a new multi-layer cache backed by sled on disk.
     ///
     /// * `memory_budget`: max bytes in memory
@@ -50,19 +54,77 @@ impl MultiLayerCache {
                 .compression_factor(9)
                 .path(path).open()?;
         Ok(Self {
-            memory_budget: memory_budget.into(),
-            disk_budget: disk_budget.into(),
-            disk_usage: 0.into(),
+            disk_budget,
             db,
         })
     }
 
-    const OBJECT_LRU: &'static [u8; 10] = b"object_lru";
-    const OBJECT_DATA: &'static [u8; 11] = b"object_data";
+    fn ivec_to_u64(ivec: sled::IVec) -> u64 {
+        let ivec = ivec.as_ref();
+        let ivec = u64::from_be_bytes([ivec[0], ivec[1], ivec[2], ivec[3], ivec[4], ivec[5], ivec[6], ivec[7]]);
+        ivec
+    }
+
+    fn get_disk_usage_(&self) -> Option<usize> {
+        let disk_usage = self.db.open_tree(Self::DISK_USAGE_TREE).unwrap();
+        let current = disk_usage.get(Self::DISK_USAGE_KEY).unwrap();
+        match current {
+            Some(current) => {
+                let current = current.as_ref();
+                let current = u64::from_be_bytes([current[0], current[1], current[2], current[3], current[4], current[5], current[6], current[7]]);
+                Some(current as usize)
+            }
+            None => None,
+        }
+    }
+
+    fn populate_disk_usage(&self) -> usize {
+        let current = match self.get_disk_usage_() {
+            Some(current) => current,
+            None => {
+                let disk_usage = self.db.open_tree(Self::DISK_USAGE_TREE).unwrap();
+                disk_usage.insert(Self::DISK_USAGE_KEY, &0u64.to_be_bytes()).unwrap();
+                0
+            }
+        };
+        current
+    }
+
+    fn get_disk_usage(&self) -> usize {
+        self.populate_disk_usage()
+    }
+
+    fn update_disk_usage(&self, disk_usage_tree: &TransactionalTree, operand: Op, value: usize) -> Result<usize> {
+        let result: Result<usize> = {
+            let current = disk_usage_tree.get(Self::DISK_USAGE_KEY)?;
+            let current = match current {
+                Some(current) => {
+                    let current = Self::ivec_to_u64(current);
+                    current as usize
+                }
+                None => 0,
+            };
+            let new_value = match operand {
+                Op::Add => current + value,
+                Op::Sub => current - value,
+            };
+            disk_usage_tree.insert(Self::DISK_USAGE_KEY, &new_value.to_be_bytes())?;
+            Ok(new_value)
+        };
+        Ok(result?)
+    }
+
+    fn fetch_add_disk_usage(&self, disk_usage_tree: &TransactionalTree, add: usize) -> Result<usize> {
+        self.update_disk_usage(disk_usage_tree, Op::Add, add)
+    }
+
+    fn fetch_sub_disk_usage(&self, disk_usage_tree: &TransactionalTree, sub: usize) -> Result<usize> {
+        self.update_disk_usage(disk_usage_tree, Op::Sub, sub)
+    }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let size = value.get_size();
-        if size > self.disk_budget.load(std::sync::atomic::Ordering::Relaxed) {
+        if size > self.disk_budget {
             return Err(CreedmoorError::CacheObjectSizeTooLarge(size));
         }
         let instant = std::time::Instant::now();
@@ -70,39 +132,51 @@ impl MultiLayerCache {
         // convert key_and_size to bytes
         let mut key_and_size = key.to_vec();
         key_and_size.extend_from_slice(&size.to_be_bytes());
-        let disk_usage = self.disk_usage.load(std::sync::atomic::Ordering::Relaxed);
+        let disk_usage = self.get_disk_usage();
         let target_storage = size + disk_usage;
         let excess = target_storage - disk_usage;
-        let mut object_data = self.db.open_tree(Self::OBJECT_DATA)?;
-        let mut object_lru = self.db.open_tree(Self::OBJECT_LRU)?;
-        let disk_budget = self.disk_budget.load(std::sync::atomic::Ordering::Relaxed);
-        (&object_lru, &object_data).transaction(|(lru, data)| {
+        let object_data = self.db.open_tree(Self::OBJECT_DATA)?;
+        let object_lru = self.db.open_tree(Self::OBJECT_LRU)?;
+        let disk_usage = self.db.open_tree(Self::DISK_USAGE_TREE)?;
+        let disk_budget = self.disk_budget;
+        let (total_to_evict, keys_to_evict) = self.gather_keys_for_eviction(&object_lru, excess)?;
+        (&object_lru, &object_data, &disk_usage).transaction(|(lru, data, disk_usage)| {
+            // TODO: Fix-up the error types to purge the expect later
             if target_storage > disk_budget {
-                self.evict_bytes(lru, data, excess);
+                self.evict_bytes(disk_usage, data, &keys_to_evict, total_to_evict).expect("Failed to evict bytes");
             }
-            self.disk_usage.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            self.fetch_add_disk_usage(disk_usage, size).expect("Failed to add disk usage");
             data.insert(key, value)?;
             // Insert key and size so we don't have to re-compute object size on eviction
-            lru.insert(&instant_bytes, key_and_size)?;
+            lru.insert(&instant_bytes, key_and_size.clone())?;
             Ok(())
         })?;
         Ok(())
     }
 
-    fn evict_bytes(&mut self, lru_tree: &TransactionalTree, data_tree: &TransactionalTree, excess: usize) {
+    fn gather_keys_for_eviction(&self, lru_tree: &Tree, excess: usize) -> Result<(usize, Vec<Vec<u8>>)> {
         let mut total_evicted = 0;
         let mut keys_to_evict = Vec::new();
-        for (key, value) in lru_tree.iter()? {
-            let size = value.pop();
-            total_evicted += size;
-            keys_to_evict.push(key.to_vec());
-            if total_evicted >= excess {
+        while total_evicted < excess {
+            if let Some((key, value)) = lru_tree.pop_min()? {
+                let value_vec = value.to_vec();
+                // grab the last eight bytes and construct the size: usize, use split
+                let (_key_bytes, size_bytes) = value_vec.split_at(value_vec.len() - 8);
+                let size = usize::from_be_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3], size_bytes[4], size_bytes[5], size_bytes[6], size_bytes[7]]);
+                total_evicted += size;
+                keys_to_evict.push(key.to_vec());
+            } else {
                 break;
             }
         }
+        Ok((total_evicted, keys_to_evict))
+    }
+
+    fn evict_bytes(&self, disk_usage_tree: &TransactionalTree, data_tree: &TransactionalTree, keys_to_evict: &[Vec<u8>], total_to_evict: usize) -> Result<()> {
         for key in keys_to_evict {
-            let size = data_tree.remove(&key).unwrap().unwrap();
+            let _size = data_tree.remove(key.as_slice())?;
         }
-        self.disk_usage.fetch_sub(total_evicted, std::sync::atomic::Ordering::Relaxed);
+        self.fetch_sub_disk_usage(disk_usage_tree, total_to_evict)?;
+        Ok(())
     }
 }
