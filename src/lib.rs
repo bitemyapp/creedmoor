@@ -28,16 +28,16 @@ pub enum Op {
 
 /// Multi-layer LRU cache: memory + sled (disk).
 pub struct MultiLayerCache {
-    disk_budget: usize,
+    pub(crate) disk_budget: usize,
     /// Sled database for on-disk storage
-    db: Db,
+    pub(crate) db: Db,
 }
 
 impl MultiLayerCache {
-    const DISK_USAGE_TREE: &'static [u8; 10] = b"disk_usage";
-    const DISK_USAGE_KEY: &'static [u8; 7] = b"current";
-    const OBJECT_LRU: &'static [u8; 10] = b"object_lru";
-    const OBJECT_DATA: &'static [u8; 11] = b"object_data";
+    pub(crate) const DISK_USAGE_TREE: &'static [u8; 10] = b"disk_usage";
+    pub(crate) const DISK_USAGE_KEY: &'static [u8; 7] = b"current";
+    pub(crate) const OBJECT_LRU: &'static [u8; 10] = b"object_lru";
+    pub(crate) const OBJECT_DATA: &'static [u8; 11] = b"object_data";
 
     /// Create a new multi-layer cache backed by sled on disk.
     ///
@@ -142,6 +142,7 @@ impl MultiLayerCache {
         let (total_to_evict, keys_to_evict) = self.gather_keys_for_eviction(&object_lru, excess)?;
         (&object_lru, &object_data, &disk_usage).transaction(|(lru, data, disk_usage)| {
             // TODO: Fix-up the error types to purge the expect later
+            println!("target_storage: {}, disk_budget: {}", target_storage, disk_budget);
             if target_storage > disk_budget {
                 self.evict_bytes(disk_usage, data, &keys_to_evict, total_to_evict).expect("Failed to evict bytes");
             }
@@ -174,7 +175,7 @@ impl MultiLayerCache {
 
     fn evict_bytes(&self, disk_usage_tree: &TransactionalTree, data_tree: &TransactionalTree, keys_to_evict: &[Vec<u8>], total_to_evict: usize) -> Result<()> {
         for key in keys_to_evict {
-            let _size = data_tree.remove(key.as_slice())?;
+            let _size = data_tree.remove(key.as_slice())?.expect(&format!("Failed to remove key marked for eviction, key was: {:?}", key));
         }
         self.fetch_sub_disk_usage(disk_usage_tree, total_to_evict)?;
         Ok(())
@@ -205,6 +206,27 @@ mod tests {
         let key = b"key";
         let value = b"value";
         cache.put(key, value).unwrap();
+        fs::remove_dir_all(sled_path).unwrap();
+    }
+
+    #[test]
+    fn test_size_limit() {
+        let memory_budget = 1024;
+        let disk_budget = 1024;
+        let sled_path = PathBuf::from("/tmp/sled-test-size-limit");
+        let mut cache = MultiLayerCache::new(memory_budget, disk_budget, sled_path.clone()).unwrap();
+        for n in 0..1024u16 {
+            let key = n.to_be_bytes();
+            let value = n.to_be_bytes();
+            cache.put(&key, &value).unwrap();
+        }
+        let data_tree = cache.db.open_tree(MultiLayerCache::OBJECT_DATA).unwrap();
+        let (min_key, _) = data_tree.pop_min().unwrap().unwrap();
+        let (max_key, _)  = data_tree.pop_max().unwrap().unwrap();
+        let min_key = u16::from_be_bytes([min_key[0], min_key[1]]);
+        let max_key = u16::from_be_bytes([max_key[0], max_key[1]]);
+        assert_eq!(min_key, 0);
+        assert_eq!(max_key, 511);
         fs::remove_dir_all(sled_path).unwrap();
     }
 }
