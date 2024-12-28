@@ -1,0 +1,9 @@
+[package]
+name = "creedmoor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+get-size = "0.1.4"
+sled = "0.34.7"
+thiserror = "2.0.9"
