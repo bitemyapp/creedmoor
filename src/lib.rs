@@ -180,3 +180,31 @@ impl MultiLayerCache {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_new() {
+        let memory_budget = 1024;
+        let disk_budget = 1024;
+        let sled_path = PathBuf::from("/tmp/sled-test-new");
+        let _cache = MultiLayerCache::new(memory_budget, disk_budget, sled_path.clone()).unwrap();
+        fs::remove_dir_all(sled_path).unwrap();
+    }
+
+    #[test]
+    fn test_put() {
+        let memory_budget = 1024;
+        let disk_budget = 1024;
+        let sled_path = PathBuf::from("/tmp/sled-test-put");
+        let mut cache = MultiLayerCache::new(memory_budget, disk_budget, sled_path.clone()).unwrap();
+        let key = b"key";
+        let value = b"value";
+        cache.put(key, value).unwrap();
+        fs::remove_dir_all(sled_path).unwrap();
+    }
+}
